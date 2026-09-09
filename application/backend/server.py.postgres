@@ -15,6 +15,20 @@ from psycopg.rows import dict_row
 import urllib.parse
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+import time
+
+REQUEST_COUNT = Counter(
+    "novaluxe_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"]
+)
+
+REQUEST_LATENCY = Histogram(
+    "novaluxe_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"]
+)
 
 # Import DB config
 try:
@@ -164,10 +178,32 @@ class NovaLuxeAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, indent=2).encode('utf-8'))
 
+        method = getattr(self, "command", "GET")
+        path = urllib.parse.urlparse(getattr(self, "path", "/")).path
+
+        REQUEST_COUNT.labels(method, path, str(status)).inc()
+        REQUEST_LATENCY.labels(method, path).observe(
+            time.time() - getattr(self, "_request_start_time", time.time())
+        )
+
     def do_GET(self):
+        start_time = time.time()
+        self._request_start_time = start_time
+
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/metrics":
+            data = generate_latest()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE_LATEST)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            REQUEST_COUNT.labels("GET", "/metrics", "200").inc()
+            REQUEST_LATENCY.labels("GET", "/metrics").observe(time.time() - start_time)
+            return
 
         # Health endpoint
         if path == "/api/health":
@@ -250,10 +286,10 @@ class NovaLuxeAPIHandler(BaseHTTPRequestHandler):
 
                     products_list.append(item)
 
-                self._send_json({
+                self._send_json(json_safe({
                     "count": len(products_list),
                     "products": products_list
-                })
+                }))
 
             except Exception as error:
                 print(f"[ERROR] Product query failed: {error}")
@@ -481,6 +517,9 @@ class NovaLuxeAPIHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        start_time = time.time()
+        self._request_start_time = start_time
+
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
