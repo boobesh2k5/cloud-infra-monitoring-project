@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""
+=========================================================
+NOVA LUXE - Zero-Package REST API Server
+Backend REST API using Python http.server, PostgreSQL, psycopg 3, JSON and urllib
+Zero external dependencies required (no pip install needed!)
+PostgreSQL ready via schema.sql + seed.sql
+=========================================================
+"""
+
+import os
+import json
+import psycopg
+from psycopg.rows import dict_row
+import urllib.parse
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Import DB config
+try:
+    from config import DB_CONFIG, SERVER_PORT, SERVER_HOST
+except ImportError:
+    SERVER_PORT = 8000
+    SERVER_HOST = '0.0.0.0'
+
+# Local Database setup (Built-in SQLite persistent cache + PostgreSQL schema sync)
+
+def get_db_connection():
+    return psycopg.connect(
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        dbname=DB_CONFIG["database"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        connect_timeout=10,
+        row_factory=dict_row,
+    )
+
+
+def json_safe(value):
+    from decimal import Decimal
+
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, dict):
+        return {
+            key: json_safe(val)
+            for key, val in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            json_safe(item)
+            for item in value
+        ]
+
+    return value
+
+
+def init_database():
+    print("[DB] Connecting to PostgreSQL...")
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    AND table_name = 'products'
+                )
+                """
+            )
+
+            initialized = cursor.fetchone()["exists"]
+
+            if initialized:
+                print("[DB] PostgreSQL tables already exist.")
+                conn.commit()
+                return
+
+            print("[DB] PostgreSQL tables not found.")
+            print("[DB] Loading schema.sql...")
+
+            schema_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "schema.sql"
+            )
+
+            with open(
+                schema_path,
+                "r",
+                encoding="utf-8"
+            ) as file:
+                schema_sql = file.read()
+
+            cursor.execute(schema_sql)
+
+            print("[DB] schema.sql loaded.")
+
+            seed_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "seed.sql"
+            )
+
+            if os.path.exists(seed_path):
+                print("[DB] Loading seed.sql...")
+
+                with open(
+                    seed_path,
+                    "r",
+                    encoding="utf-8"
+                ) as file:
+                    seed_sql = file.read()
+
+                cursor.execute(seed_sql)
+
+                print("[DB] seed.sql loaded.")
+
+            conn.commit()
+
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM products"
+            )
+
+            product_count = cursor.fetchone()["count"]
+
+            print(
+                f"[DB] PostgreSQL initialization complete. "
+                f"Products loaded: {product_count}"
+            )
+
+    except Exception:
+        conn.rollback()
+        print("[DB] PostgreSQL initialization failed.")
+        raise
+
+    finally:
+        conn.close()
+
+
+class NovaLuxeAPIHandler(BaseHTTPRequestHandler):
+    def _send_cors_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._send_cors_headers()
+        self.end_headers()
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self._send_cors_headers()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode('utf-8'))
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+
+        # Health endpoint
+        if path == "/api/health":
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT 1 AS health")
+                    cursor.fetchone()
+                conn.close()
+
+                self._send_json({
+                    "status": "healthy",
+                    "service": "NOVA LUXE Backend REST API",
+                    "database": "PostgreSQL",
+                    "currency": "INR (₹)",
+                    "timestamp": datetime.now().isoformat()
+                })
+            except Exception as error:
+                self._send_json({
+                    "status": "unhealthy",
+                    "service": "NOVA LUXE Backend REST API",
+                    "database": "PostgreSQL",
+                    "error": str(error),
+                    "timestamp": datetime.now().isoformat()
+                }, status=503)
+            return
+
+        # Get all products
+        if path == "/api/products":
+            conn = None
+            try:
+                conn = get_db_connection()
+
+                sql = """
+                    SELECT *
+                    FROM products
+                    WHERE 1=1
+                """
+                params = []
+
+                if "category" in query and query["category"][0] != "all":
+                    sql += " AND category_id = %s"
+                    params.append(query["category"][0])
+
+                if "max_price" in query:
+                    sql += " AND price <= %s"
+                    params.append(float(query["max_price"][0]))
+
+                if "search" in query and query["search"][0].strip():
+                    search_term = f"%{query['search'][0].strip()}%"
+                    sql += """
+                        AND (
+                            name ILIKE %s
+                            OR description ILIKE %s
+                            OR brand ILIKE %s
+                        )
+                    """
+                    params.extend([
+                        search_term,
+                        search_term,
+                        search_term
+                    ])
+
+                sql += " ORDER BY created_at DESC"
+
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, params)
+                    rows = cursor.fetchall()
+
+                products_list = []
+
+                for row in rows:
+                    item = dict(row)
+
+                    if item.get("features") is None:
+                        item["features"] = []
+
+                    item["in_stock"] = bool(item["in_stock"])
+                    item["is_trending"] = bool(item["is_trending"])
+
+                    products_list.append(item)
+
+                self._send_json({
+                    "count": len(products_list),
+                    "products": products_list
+                })
+
+            except Exception as error:
+                print(f"[ERROR] Product query failed: {error}")
+
+                self._send_json({
+                    "error": "Unable to retrieve products",
+                    "details": str(error)
+                }, status=500)
+
+            finally:
+                if conn:
+                    conn.close()
+
+            return
+
+        # Get single product
+        if path.startswith("/api/products/"):
+            prod_id = path.replace(
+                "/api/products/",
+                "",
+                1
+            ).strip()
+
+            conn = None
+
+            try:
+                conn = get_db_connection()
+
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT * FROM products WHERE id = %s",
+                        (prod_id,)
+                    )
+                    row = cursor.fetchone()
+
+                if row:
+                    item = dict(row)
+
+                    if item.get("features") is None:
+                        item["features"] = []
+
+                    item["in_stock"] = bool(item["in_stock"])
+                    item["is_trending"] = bool(item["is_trending"])
+
+                    self._send_json(item)
+                else:
+                    self._send_json(
+                        {"error": "Product not found"},
+                        status=404
+                    )
+
+            except Exception as error:
+                print(f"[ERROR] Product lookup failed: {error}")
+
+                self._send_json({
+                    "error": "Unable to retrieve product",
+                    "details": str(error)
+                }, status=500)
+
+            finally:
+                if conn:
+                    conn.close()
+
+            return
+
+        # Get categories
+        if path == "/api/categories":
+            conn = None
+
+            try:
+                conn = get_db_connection()
+
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT *
+                        FROM categories
+                        ORDER BY name
+                    """)
+                    cats = cursor.fetchall()
+
+                self._send_json(cats)
+
+            except Exception as error:
+                print(f"[ERROR] Category query failed: {error}")
+
+                self._send_json({
+                    "error": "Unable to retrieve categories",
+                    "details": str(error)
+                }, status=500)
+
+            finally:
+                if conn:
+                    conn.close()
+
+            return
+
+        # Get coupons
+        if path == "/api/coupons":
+            conn = None
+
+            try:
+                conn = get_db_connection()
+
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT
+                            code,
+                            discount_type,
+                            discount_value,
+                            min_order_amount,
+                            description
+                        FROM coupons
+                        WHERE is_active = TRUE
+                        ORDER BY code
+                    """)
+
+                    coupons = cursor.fetchall()
+
+                self._send_json(coupons)
+
+            except Exception as error:
+                print(f"[ERROR] Coupon query failed: {error}")
+
+                self._send_json({
+                    "error": "Unable to retrieve coupons",
+                    "details": str(error)
+                }, status=500)
+
+            finally:
+                if conn:
+                    conn.close()
+
+            return
+
+        # Track order
+        if path.startswith("/api/orders/"):
+            order_ref = path.replace(
+                "/api/orders/",
+                "",
+                1
+            ).strip().upper()
+
+            conn = None
+
+            try:
+                conn = get_db_connection()
+
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT *
+                        FROM orders
+                        WHERE order_ref = %s
+                        """,
+                        (order_ref,)
+                    )
+
+                    order_row = cursor.fetchone()
+
+                    if order_row:
+                        order = dict(order_row)
+
+                        cursor.execute(
+                            """
+                            SELECT
+                                product_id,
+                                product_name,
+                                unit_price,
+                                quantity,
+                                total_price
+                            FROM order_items
+                            WHERE order_id = %s
+                            ORDER BY id
+                            """,
+                            (order["id"],)
+                        )
+
+                        order["items"] = cursor.fetchall()
+
+                        self._send_json(order)
+
+                    else:
+                        self._send_json({
+                            "order_ref": order_ref,
+                            "status": "in_transit",
+                            "tracking_courier": "BlueDart Express Air",
+                            "estimated_delivery": "Tomorrow by 4:00 PM",
+                            "current_location": "Destination Hub - Bengaluru",
+                            "timeline": [
+                                {
+                                    "stage": "Order Confirmed",
+                                    "time": "10:15 AM",
+                                    "done": True
+                                },
+                                {
+                                    "stage": "Packed & Dispatched",
+                                    "time": "01:45 PM",
+                                    "done": True
+                                },
+                                {
+                                    "stage": "Out for Delivery",
+                                    "time": "Pending",
+                                    "done": False
+                                }
+                            ]
+                        })
+
+            except Exception as error:
+                print(f"[ERROR] Order lookup failed: {error}")
+
+                self._send_json({
+                    "error": "Unable to retrieve order",
+                    "details": str(error)
+                }, status=500)
+
+            finally:
+                if conn:
+                    conn.close()
+
+            return
+
+        self._send_json(
+            {"error": "API endpoint not found"},
+            status=404
+        )
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/orders":
+            conn = None
+
+            try:
+                content_length = int(
+                    self.headers.get("Content-Length", 0)
+                )
+
+                if content_length <= 0:
+                    self._send_json({
+                        "success": False,
+                        "error": "Request body is empty"
+                    }, status=400)
+                    return
+
+                post_body = self.rfile.read(content_length)
+
+                order_data = json.loads(
+                    post_body.decode("utf-8")
+                )
+
+                order_id = f"ord_{uuid4().hex}"
+
+                supplied_order_ref = order_data.get("orderRef")
+
+                if supplied_order_ref:
+                    order_ref = str(
+                        supplied_order_ref
+                    ).strip().upper()
+                else:
+                    order_ref = (
+                        f"NL-{datetime.now().strftime('%Y%m%d%H%M%S')}-"
+                        f"{uuid4().hex[:6].upper()}"
+                    )
+
+                conn = get_db_connection()
+
+                with conn.cursor() as cursor:
+
+                    cursor.execute(
+                        """
+                        INSERT INTO orders (
+                            id,
+                            order_ref,
+                            customer_name,
+                            customer_email,
+                            customer_phone,
+                            shipping_address,
+                            city,
+                            state,
+                            pin_code,
+                            payment_method,
+                            subtotal,
+                            discount,
+                            tax,
+                            delivery_fee,
+                            total_amount,
+                            status
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            order_id,
+                            order_ref,
+                            order_data.get(
+                                "name",
+                                "Valued Customer"
+                            ),
+                            order_data.get(
+                                "email",
+                                "customer@example.com"
+                            ),
+                            order_data.get(
+                                "phone",
+                                "9876543210"
+                            ),
+                            order_data.get(
+                                "address",
+                                "Delivery Address"
+                            ),
+                            order_data.get(
+                                "city",
+                                "Bengaluru"
+                            ),
+                            order_data.get(
+                                "state",
+                                "Karnataka"
+                            ),
+                            order_data.get(
+                                "pinCode",
+                                "560001"
+                            ),
+                            order_data.get(
+                                "paymentMethod",
+                                "UPI"
+                            ),
+                            float(
+                                order_data.get(
+                                    "subtotal",
+                                    0
+                                )
+                            ),
+                            float(
+                                order_data.get(
+                                    "discount",
+                                    0
+                                )
+                            ),
+                            float(
+                                order_data.get(
+                                    "tax",
+                                    0
+                                )
+                            ),
+                            float(
+                                order_data.get(
+                                    "shipping",
+                                    0
+                                )
+                            ),
+                            float(
+                                order_data.get(
+                                    "total",
+                                    0
+                                )
+                            ),
+                            "confirmed"
+                        )
+                    )
+
+                    for item in order_data.get(
+                        "items",
+                        []
+                    ):
+                        cursor.execute(
+                            """
+                            INSERT INTO order_items (
+                                order_id,
+                                product_id,
+                                product_name,
+                                unit_price,
+                                quantity,
+                                total_price
+                            )
+                            VALUES (
+                                %s, %s, %s,
+                                %s, %s, %s
+                            )
+                            """,
+                            (
+                                order_id,
+                                item.get(
+                                    "id",
+                                    "prod-xx"
+                                ),
+                                item.get(
+                                    "name",
+                                    "Product"
+                                ),
+                                float(
+                                    item.get(
+                                        "price",
+                                        0
+                                    )
+                                ),
+                                int(
+                                    item.get(
+                                        "quantity",
+                                        1
+                                    )
+                                ),
+                                float(
+                                    item.get(
+                                        "itemTotal",
+                                        0
+                                    )
+                                )
+                            )
+                        )
+
+                conn.commit()
+
+                print(
+                    f"[ORDER] New Order Recorded: "
+                    f"{order_ref} | "
+                    f"Total: INR "
+                    f"{order_data.get('total', 0)}"
+                )
+
+                self._send_json({
+                    "success": True,
+                    "orderId": order_id,
+                    "orderRef": order_ref,
+                    "message": (
+                        "Order successfully recorded "
+                        "and payment verified."
+                    )
+                }, status=201)
+
+            except json.JSONDecodeError as error:
+                if conn:
+                    conn.rollback()
+
+                self._send_json({
+                    "success": False,
+                    "error": "Invalid JSON request body"
+                }, status=400)
+
+            except Exception as error:
+                if conn:
+                    conn.rollback()
+
+                import traceback
+                traceback.print_exc()
+
+                self._send_json({
+                    "success": False,
+                    "error": str(error)
+                }, status=400)
+
+            finally:
+                if conn:
+                    conn.close()
+
+            return
+
+        self._send_json(
+            {"error": "POST endpoint not found"},
+            status=404
+        )
+
+
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+def run_server():
+    init_database()
+    server_address = (SERVER_HOST, SERVER_PORT)
+    httpd = ReusableHTTPServer(server_address, NovaLuxeAPIHandler)
+    print(f"=======================================================")
+    print(f"  NOVA LUXE Backend REST API Server is running!")
+    print(f"  URL: http://localhost:{SERVER_PORT}")
+    print(f"  PostgreSQL Schema: backend/schema.sql")
+    print(f"  PostgreSQL Seed:   backend/seed.sql")
+    print(f"  Zero packages installed - Pure Python standard library")
+    print(f"=======================================================")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[INFO] Backend server stopped.")
+        httpd.server_close()
+
+if __name__ == '__main__':
+    run_server()

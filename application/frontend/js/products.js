@@ -3,7 +3,7 @@
 // Supports 24 Curated Products + Backend REST API Sync
 // =========================================================
 
-const API_BASE_URL = 'http://localhost:8000/api';
+const API_BASE_URL = '/api';
 
 /**
  * Formats a number to Indian Rupee (INR) currency representation

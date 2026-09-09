@@ -283,7 +283,7 @@ resource "aws_security_group" "eks_nodes" {
   ingress {
     description = "Node to node communication"
     from_port   = 0
-    to_port     = 65535
+    to_port     = 0
     protocol    = "-1"
     self        = true
   }
@@ -472,7 +472,7 @@ resource "aws_eks_node_group" "main" {
   subnet_ids = aws_subnet.private[*].id
 
   instance_types = [
-    "t3.medium"
+    "t3.micro"
   ]
 
   capacity_type = "ON_DEMAND"
@@ -517,11 +517,13 @@ resource "aws_security_group" "rds" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description     = "PostgreSQL from EKS nodes"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.eks_nodes.id]
+    description = "PostgreSQL from EKS nodes"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    security_groups = [
+      data.aws_eks_cluster.main.vpc_config[0].cluster_security_group_id
+    ]
   }
 
   egress {
@@ -583,7 +585,7 @@ resource "aws_db_instance" "postgres" {
 
   multi_az = false
 
-  backup_retention_period = 7
+  backup_retention_period = 0
 
   skip_final_snapshot = true
 
@@ -594,4 +596,13 @@ resource "aws_db_instance" "postgres" {
     Project     = "cloud-infra-monitoring"
     Environment = "dev"
   }
+}
+
+# Read the AWS-generated EKS cluster security group
+data "aws_eks_cluster" "main" {
+  name = aws_eks_cluster.main.name
+
+  depends_on = [
+    aws_eks_cluster.main
+  ]
 }
