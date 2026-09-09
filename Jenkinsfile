@@ -17,9 +17,6 @@ pipeline {
 
         EKS_CLUSTER     = 'project2-monitoring'
 
-        BACKEND_IMAGE   = "${ECR_REGISTRY}/${ECR_REPOSITORY}:backend-${BUILD_NUMBER}"
-        FRONTEND_IMAGE  = "${ECR_REGISTRY}/${ECR_REPOSITORY}:frontend-${BUILD_NUMBER}"
-
         BACKEND_DEPLOYMENT  = 'novaluxe-backend'
         FRONTEND_DEPLOYMENT = 'novaluxe-frontend'
 
@@ -40,36 +37,56 @@ pipeline {
                     ]]
                 ])
 
+                script {
+                    env.GIT_SHA = sh(
+                        script: 'git rev-parse --short=8 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.GIT_BRANCH_NAME = sh(
+                        script: 'git branch --show-current || true',
+                        returnStdout: true
+                    ).trim()
+
+                    env.BACKEND_IMAGE =
+                        "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:backend-${env.GIT_SHA}"
+
+                    env.FRONTEND_IMAGE =
+                        "${env.ECR_REGISTRY}/${env.ECR_REPOSITORY}:frontend-${env.GIT_SHA}"
+                }
+
                 sh '''
-                    echo "Git commit:"
-                    git rev-parse --short HEAD
-
-                    echo "Git branch:"
-                    git branch --show-current
-
-                    echo "Project structure:"
-                    ls -la
-                    ls -la application/backend
-                    ls -la application/frontend
+                    echo "=========================================="
+                    echo "SOURCE INFORMATION"
+                    echo "=========================================="
+                    echo "Commit : ${GIT_SHA}"
+                    echo "Branch : ${GIT_BRANCH_NAME}"
+                    echo "Build  : ${BUILD_NUMBER}"
+                    echo "Backend: ${BACKEND_IMAGE}"
+                    echo "Frontend: ${FRONTEND_IMAGE}"
+                    echo "=========================================="
                 '''
             }
         }
 
         stage('Validate Source') {
             steps {
-                echo 'Validating application source files...'
+                echo 'Validating required source files...'
 
                 sh '''
                     set -e
 
                     test -f application/backend/Dockerfile
                     test -f application/backend/server.py.postgres
+                    test -f application/backend/config.py
+                    test -f application/backend/schema.sql
+                    test -f application/backend/seed.sql
 
                     test -f application/frontend/Dockerfile
                     test -f application/frontend/nginx.conf
                     test -f application/frontend/index.html
 
-                    echo "Required source files are present."
+                    echo "Source validation passed."
                 '''
             }
         }
@@ -82,22 +99,22 @@ pipeline {
                     set -e
 
                     kubectl apply \
-                      --dry-run=client \
-                      -f k8s/backend.yaml
+                        --dry-run=client \
+                        -f k8s/backend.yaml
 
                     if [ -f application/frontend/frontend-deployment.yaml ]; then
                         kubectl apply \
-                          --dry-run=client \
-                          -f application/frontend/frontend-deployment.yaml
+                            --dry-run=client \
+                            -f application/frontend/frontend-deployment.yaml
                     fi
 
                     if [ -f application/frontend/frontend-service.yaml ]; then
                         kubectl apply \
-                          --dry-run=client \
-                          -f application/frontend/frontend-service.yaml
+                            --dry-run=client \
+                            -f application/frontend/frontend-service.yaml
                     fi
 
-                    echo "Kubernetes manifests passed validation."
+                    echo "Kubernetes manifest validation passed."
                 '''
             }
         }
@@ -107,34 +124,38 @@ pipeline {
 
                 stage('Build Backend') {
                     steps {
-                        echo "Building backend image: ${BACKEND_IMAGE}"
+                        echo "Building backend: ${BACKEND_IMAGE}"
 
                         sh '''
+                            set -e
+
                             docker build \
-                              -t ${BACKEND_IMAGE} \
-                              -f application/backend/Dockerfile \
-                              application/backend
+                                -t ${BACKEND_IMAGE} \
+                                -f application/backend/Dockerfile \
+                                application/backend
 
                             docker image inspect ${BACKEND_IMAGE} > /dev/null
 
-                            echo "Backend image built successfully."
+                            echo "Backend build successful."
                         '''
                     }
                 }
 
                 stage('Build Frontend') {
                     steps {
-                        echo "Building frontend image: ${FRONTEND_IMAGE}"
+                        echo "Building frontend: ${FRONTEND_IMAGE}"
 
                         sh '''
+                            set -e
+
                             docker build \
-                              -t ${FRONTEND_IMAGE} \
-                              -f application/frontend/Dockerfile \
-                              application/frontend
+                                -t ${FRONTEND_IMAGE} \
+                                -f application/frontend/Dockerfile \
+                                application/frontend
 
                             docker image inspect ${FRONTEND_IMAGE} > /dev/null
 
-                            echo "Frontend image built successfully."
+                            echo "Frontend build successful."
                         '''
                     }
                 }
@@ -143,36 +164,36 @@ pipeline {
 
         stage('Security Scan - Trivy') {
             steps {
-                echo 'Scanning container images with Trivy...'
+                echo 'Running Trivy vulnerability scans...'
 
                 sh '''
-                    set +e
+                    set -e
 
-                    echo "Scanning backend..."
+                    echo "=========================================="
+                    echo "BACKEND SECURITY SCAN"
+                    echo "=========================================="
+
                     trivy image \
-                      --severity HIGH,CRITICAL \
-                      --exit-code 0 \
-                      ${BACKEND_IMAGE}
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        ${BACKEND_IMAGE}
 
-                    BACKEND_SCAN_STATUS=$?
+                    echo "=========================================="
+                    echo "FRONTEND SECURITY SCAN"
+                    echo "=========================================="
 
-                    echo "Scanning frontend..."
                     trivy image \
-                      --severity HIGH,CRITICAL \
-                      --exit-code 0 \
-                      ${FRONTEND_IMAGE}
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        ${FRONTEND_IMAGE}
 
-                    FRONTEND_SCAN_STATUS=$?
-
-                    echo "Trivy backend status: ${BACKEND_SCAN_STATUS}"
-                    echo "Trivy frontend status: ${FRONTEND_SCAN_STATUS}"
-
-                    echo "Security scan completed."
+                    echo "Trivy scanning completed."
+                    echo "Current mode: REPORT ONLY"
                 '''
             }
         }
 
-        stage('AWS Validation') {
+        stage('AWS & EKS Validation') {
             steps {
                 echo 'Validating AWS identity and EKS access...'
 
@@ -182,13 +203,15 @@ pipeline {
                     echo "AWS identity:"
                     aws sts get-caller-identity
 
+                    echo
                     echo "EKS cluster:"
                     aws eks describe-cluster \
-                      --region ${AWS_REGION} \
-                      --name ${EKS_CLUSTER} \
-                      --query 'cluster.name' \
-                      --output text
+                        --region ${AWS_REGION} \
+                        --name ${EKS_CLUSTER} \
+                        --query 'cluster.name' \
+                        --output text
 
+                    echo
                     echo "EKS nodes:"
                     kubectl get nodes
                 '''
@@ -197,57 +220,63 @@ pipeline {
 
         stage('Login to ECR') {
             steps {
-                echo 'Authenticating with Amazon ECR...'
+                echo 'Logging into Amazon ECR...'
 
-                sh '''
-                    set -e
+                retry(2) {
+                    sh '''
+                        set -e
 
-                    aws ecr get-login-password \
-                      --region ${AWS_REGION} \
-                    | docker login \
-                      --username AWS \
-                      --password-stdin ${ECR_REGISTRY}
+                        aws ecr get-login-password \
+                            --region ${AWS_REGION} \
+                        | docker login \
+                            --username AWS \
+                            --password-stdin ${ECR_REGISTRY}
 
-                    echo "ECR login successful."
-                '''
+                        echo "ECR authentication successful."
+                    '''
+                }
             }
         }
 
-        stage('Push Images') {
+        stage('Push Images to ECR') {
             steps {
                 echo 'Pushing images to Amazon ECR...'
 
-                sh '''
-                    set -e
+                retry(2) {
+                    sh '''
+                        set -e
 
-                    docker push ${BACKEND_IMAGE}
-                    docker push ${FRONTEND_IMAGE}
+                        docker push ${BACKEND_IMAGE}
+                        docker push ${FRONTEND_IMAGE}
 
-                    echo "Both images pushed successfully."
-                '''
+                        echo "Images pushed successfully."
+                    '''
+                }
             }
         }
 
         stage('Deploy to EKS') {
             steps {
-                echo 'Deploying new images to EKS...'
+                echo 'Deploying application to EKS...'
 
                 sh '''
                     set -e
 
                     aws eks update-kubeconfig \
-                      --region ${AWS_REGION} \
-                      --name ${EKS_CLUSTER}
+                        --region ${AWS_REGION} \
+                        --name ${EKS_CLUSTER}
 
-                    echo "Updating backend..."
-                    kubectl set image deployment/${BACKEND_DEPLOYMENT} \
-                      backend=${BACKEND_IMAGE}
+                    echo "Updating backend image..."
+                    kubectl set image \
+                        deployment/${BACKEND_DEPLOYMENT} \
+                        backend=${BACKEND_IMAGE}
 
-                    echo "Updating frontend..."
-                    kubectl set image deployment/${FRONTEND_DEPLOYMENT} \
-                      frontend=${FRONTEND_IMAGE}
+                    echo "Updating frontend image..."
+                    kubectl set image \
+                        deployment/${FRONTEND_DEPLOYMENT} \
+                        frontend=${FRONTEND_IMAGE}
 
-                    echo "Deployment images updated."
+                    echo "EKS deployment triggered."
                 '''
             }
         }
@@ -260,22 +289,21 @@ pipeline {
                     set -e
 
                     kubectl rollout status \
-                      deployment/${BACKEND_DEPLOYMENT} \
-                      --timeout=180s
+                        deployment/${BACKEND_DEPLOYMENT} \
+                        --timeout=180s
 
                     kubectl rollout status \
-                      deployment/${FRONTEND_DEPLOYMENT} \
-                      --timeout=180s
+                        deployment/${FRONTEND_DEPLOYMENT} \
+                        --timeout=180s
 
-                    echo "Backend rollout successful."
-                    echo "Frontend rollout successful."
+                    echo "Both deployments rolled out successfully."
                 '''
             }
         }
 
-        stage('Application Health Verification') {
+        stage('Application Health Check') {
             steps {
-                echo 'Checking application health inside Kubernetes...'
+                echo 'Running post-deployment application health checks...'
 
                 sh '''
                     set -e
@@ -283,70 +311,115 @@ pipeline {
                     echo "Backend deployment:"
                     kubectl get deployment ${BACKEND_DEPLOYMENT}
 
+                    echo
                     echo "Backend pods:"
                     kubectl get pods \
-                      -l app=${BACKEND_DEPLOYMENT} \
-                      -o wide
+                        -l app=${BACKEND_DEPLOYMENT} \
+                        -o wide
 
+                    echo
                     echo "Frontend deployment:"
                     kubectl get deployment ${FRONTEND_DEPLOYMENT}
 
+                    echo
                     echo "Frontend pods:"
                     kubectl get pods \
-                      -l app=${FRONTEND_DEPLOYMENT} \
-                      -o wide
+                        -l app=${FRONTEND_DEPLOYMENT} \
+                        -o wide
 
-                    echo "Backend endpoints:"
+                    echo
+                    echo "Backend service endpoints:"
                     kubectl get endpoints novaluxe-backend
 
+                    echo
                     echo "Frontend service:"
                     kubectl get svc novaluxe-frontend
+
+                    echo
+                    echo "Testing backend API from inside the backend pod..."
+
+                    BACKEND_POD=$(kubectl get pods \
+                        -l app=${BACKEND_DEPLOYMENT} \
+                        -o jsonpath='{.items[0].metadata.name}')
+
+                    kubectl exec "${BACKEND_POD}" -- \
+                        python -c "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/api/products', timeout=10); print('HTTP STATUS:', r.status)"
+
+                    echo
+                    echo "Backend API health check passed."
                 '''
             }
         }
 
         stage('Monitoring Verification') {
             steps {
-                echo 'Verifying Prometheus monitoring integration...'
+                echo 'Verifying Prometheus monitoring...'
 
                 sh '''
                     set -e
 
-                    echo "Prometheus target health:"
-                    curl -fsS "${PROMETHEUS_URL}/api/v1/query" \
-                      --data-urlencode 'query=up{job="novaluxe-backend"}' \
-                      | python3 -m json.tool
+                    echo "=========================================="
+                    echo "NOVA LUXE BACKEND TARGET"
+                    echo "=========================================="
 
-                    echo "Checking NovaLuxe application metrics:"
                     curl -fsS "${PROMETHEUS_URL}/api/v1/query" \
-                      --data-urlencode 'query=novaluxe_http_requests_total' \
-                      | python3 -m json.tool
+                        --data-urlencode 'query=up{job="novaluxe-backend"}' \
+                        | python3 -m json.tool
 
-                    echo "Checking EKS Kubernetes metrics:"
+                    echo
+                    echo "=========================================="
+                    echo "NOVA LUXE APPLICATION METRICS"
+                    echo "=========================================="
+
                     curl -fsS "${PROMETHEUS_URL}/api/v1/query" \
-                      --data-urlencode 'query=kube_pod_info' \
-                      | python3 -m json.tool \
-                      | head -80
+                        --data-urlencode 'query=novaluxe_http_requests_total' \
+                        | python3 -m json.tool
 
-                    echo "Checking Jenkins metrics target:"
+                    echo
+                    echo "=========================================="
+                    echo "EKS / KUBERNETES METRICS"
+                    echo "=========================================="
+
                     curl -fsS "${PROMETHEUS_URL}/api/v1/query" \
-                      --data-urlencode 'query=up{job="jenkins"}' \
-                      | python3 -m json.tool
+                        --data-urlencode 'query=kube_pod_info' \
+                        | python3 -m json.tool \
+                        | head -80
 
-                    echo "Monitoring verification completed."
+                    echo
+                    echo "=========================================="
+                    echo "JENKINS METRICS TARGET"
+                    echo "=========================================="
+
+                    curl -fsS "${PROMETHEUS_URL}/api/v1/query" \
+                        --data-urlencode 'query=up{job="jenkins"}' \
+                        | python3 -m json.tool
+
+                    echo
+                    echo "Prometheus monitoring verification passed."
                 '''
             }
         }
 
         stage('Deployment Summary') {
             steps {
+                echo 'Generating deployment summary...'
+
                 sh '''
+                    echo
                     echo "=========================================="
                     echo "        DEPLOYMENT SUMMARY"
                     echo "=========================================="
 
-                    echo "Cluster:"
-                    kubectl config current-context
+                    echo "Git Commit:"
+                    echo "${GIT_SHA}"
+
+                    echo
+                    echo "Build Number:"
+                    echo "${BUILD_NUMBER}"
+
+                    echo
+                    echo "EKS Cluster:"
+                    echo "${EKS_CLUSTER}"
 
                     echo
                     echo "Nodes:"
@@ -354,24 +427,33 @@ pipeline {
 
                     echo
                     echo "Backend:"
-                    kubectl get pods -l app=${BACKEND_DEPLOYMENT} -o wide
+                    kubectl get pods \
+                        -l app=${BACKEND_DEPLOYMENT} \
+                        -o wide
 
                     echo
                     echo "Frontend:"
-                    kubectl get pods -l app=${FRONTEND_DEPLOYMENT} -o wide
+                    kubectl get pods \
+                        -l app=${FRONTEND_DEPLOYMENT} \
+                        -o wide
 
                     echo
                     echo "Backend Image:"
                     kubectl get deployment ${BACKEND_DEPLOYMENT} \
-                      -o jsonpath='{.spec.template.spec.containers[0].image}'
+                        -o jsonpath='{.spec.template.spec.containers[0].image}'
                     echo
 
                     echo
                     echo "Frontend Image:"
                     kubectl get deployment ${FRONTEND_DEPLOYMENT} \
-                      -o jsonpath='{.spec.template.spec.containers[0].image}'
+                        -o jsonpath='{.spec.template.spec.containers[0].image}'
                     echo
 
+                    echo
+                    echo "Grafana / Prometheus monitoring:"
+                    echo "${PROMETHEUS_URL}"
+
+                    echo
                     echo "=========================================="
                     echo "       DEPLOYMENT COMPLETED"
                     echo "=========================================="
@@ -383,35 +465,60 @@ pipeline {
     post {
 
         success {
-            echo '''
+            echo """
 ==========================================
  CI/CD PIPELINE SUCCESSFUL
 ==========================================
-GitHub → Jenkins → Docker → Trivy → ECR
-      → EKS → Prometheus → Grafana
+Build      : ${env.BUILD_NUMBER}
+Git SHA    : ${env.GIT_SHA}
+Backend    : ${env.BACKEND_IMAGE}
+Frontend   : ${env.FRONTEND_IMAGE}
+Cluster    : ${env.EKS_CLUSTER}
+
+GitHub
+  ↓
+Jenkins
+  ↓
+Docker Build
+  ↓
+Trivy
+  ↓
+Amazon ECR
+  ↓
+Amazon EKS
+  ↓
+Application Health Check
+  ↓
+Prometheus
+  ↓
+Grafana
 ==========================================
-'''
+"""
         }
 
         failure {
-            echo '''
+            echo """
 ==========================================
  CI/CD PIPELINE FAILED
 ==========================================
-Check the failed stage above.
+Build   : ${env.BUILD_NUMBER}
+Git SHA : ${env.GIT_SHA}
+
+Check the failed stage in the Jenkins console.
 ==========================================
-'''
+"""
         }
 
         always {
             sh '''
                 docker logout ${ECR_REGISTRY} || true
+
+                docker rmi ${BACKEND_IMAGE} || true
+                docker rmi ${FRONTEND_IMAGE} || true
             '''
 
-            sh '''
-                echo "Jenkins build: ${BUILD_NUMBER}"
-                echo "Result: ${currentBuild.currentResult}"
-            '''
+            echo "Jenkins build: ${env.BUILD_NUMBER}"
+            echo "Pipeline result: ${currentBuild.currentResult}"
         }
     }
 }
