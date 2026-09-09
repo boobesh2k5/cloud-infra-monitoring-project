@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: novaluxe-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: novaluxe-frontend
+  template:
+    metadata:
+      labels:
+        app: novaluxe-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: 363267429195.dkr.ecr.eu-north-1.amazonaws.com/cloud-infra-monitoring-project:frontend-v2
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
